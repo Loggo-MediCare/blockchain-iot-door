@@ -1,0 +1,24 @@
+{
+  "name": "blockchain-iot-door",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "chain": "hardhat node",
+    "deploy": "hardhat run scripts/deploy.js --network localhost",
+    "rent": "hardhat run scripts/rent.js --network localhost",
+    "listen": "node listener.js",
+    "mock-door": "node tools/mock-esp32.js",
+    "attack-test": "node tools/attack-test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^3.0.8",
+    "ethers": "^6.13.4",
+    "hardhat": "^2.22.17"
+  }
+}

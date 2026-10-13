@@ -1,0 +1,6 @@
+node_modules/
+artifacts/
+cache/
+deployed.json
+esp32/door_lock/secrets.h
+.env
