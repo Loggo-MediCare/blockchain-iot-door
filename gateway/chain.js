@@ -11,6 +11,7 @@
 const fs = require("fs");
 const path = require("path");
 const { ethers } = require("ethers");
+const { parseRoomId, parseWallet } = require("./validate");
 
 class GatewayStartupError extends Error {
   constructor(message) {
@@ -45,20 +46,6 @@ function maskImmutables(code, ranges) {
     hex = hex.slice(0, start * 2) + "0".repeat(length * 2) + hex.slice((start + length) * 2);
   }
   return hex;
-}
-
-function parseRoomId(roomId) {
-  if (typeof roomId === "number" && Number.isSafeInteger(roomId) && roomId >= 0) return BigInt(roomId);
-  if (typeof roomId === "bigint" && roomId >= 0n) return roomId;
-  if (typeof roomId === "string" && /^[0-9]{1,18}$/.test(roomId)) return BigInt(roomId);
-  throw new TypeError(`invalid room id: ${String(roomId)}`);
-}
-
-function parseWallet(wallet) {
-  if (typeof wallet !== "string" || !ethers.isAddress(wallet)) {
-    throw new TypeError(`invalid wallet address: ${String(wallet)}`);
-  }
-  return ethers.getAddress(wallet);
 }
 
 async function connectChain({ provider, address, chainId, projectRoot, now = Date.now, rpcTimeoutMs = 5000 }) {
