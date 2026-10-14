@@ -7,7 +7,10 @@
 // same address.
 //
 // checkAccess() always asks hasAccess() with the gateway's own clock. It takes
-// no time argument; anything extra a caller passes is ignored.
+// no time argument; anything extra a caller passes is ignored. Each call is one
+// consistent read pinned to a single block: the contract identity is checked
+// again (a local chain can be reset at any time), and the booking that grants
+// access is returned so the caller gets a trusted checkOut.
 const fs = require("fs");
 const path = require("path");
 const { ethers } = require("ethers");
@@ -19,6 +22,16 @@ class GatewayStartupError extends Error {
     this.name = "GatewayStartupError";
   }
 }
+
+class ChainIdentityError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ChainIdentityError";
+    this.code = "CHAIN_IDENTITY";
+  }
+}
+
+const BOOKED = 0n;
 
 function withTimeout(promise, ms, what) {
   let timer;
@@ -48,7 +61,8 @@ function maskImmutables(code, ranges) {
   return hex;
 }
 
-async function connectChain({ provider, address, chainId, projectRoot, now = Date.now, rpcTimeoutMs = 5000 }) {
+// 4 s leaves room inside the 5 s VERIFYING window for authorize() and consume().
+async function connectChain({ provider, address, chainId, projectRoot, now = Date.now, rpcTimeoutMs = 4000 }) {
   if (typeof address !== "string" || !ethers.isAddress(address)) {
     throw new GatewayStartupError(`invalid contract address: ${String(address)}`);
   }
@@ -74,6 +88,28 @@ async function connectChain({ provider, address, chainId, projectRoot, now = Dat
 
   const contract = new ethers.Contract(address, artifact.abi, provider);
   const gatewaySeconds = () => Math.floor(now() / 1000);
+  const verifiedCode = maskImmutables(code, artifact.immutableRanges);
+
+  async function pinnedRead(room, renter, checkedAt) {
+    const blockTag = await provider.getBlockNumber();
+    // Identity first, at the pinned block; only then ask the contract.
+    const currentCode = await provider.getCode(address, blockTag);
+    if (currentCode === "0x") throw new ChainIdentityError(`no contract code at ${address} any more; chain reset?`);
+    if (maskImmutables(currentCode, artifact.immutableRanges) !== verifiedCode) {
+      throw new ChainIdentityError(`contract at ${address} is no longer RentalBooking`);
+    }
+    const allowed = await contract.hasAccess(room, renter, checkedAt, { blockTag });
+    if (!allowed) return { allowed: false, checkedAt, booking: null };
+
+    // Same block: find the booking that grants access, for its checkOut.
+    const ids = await contract.getActiveBookingIds(room, { blockTag });
+    const bookings = await Promise.all(ids.map((id) => contract.getBooking(id, { blockTag })));
+    const match = bookings.findIndex(
+      (b) => b.status === BOOKED && b.renter === renter && b.checkIn <= BigInt(checkedAt) && BigInt(checkedAt) < b.checkOut
+    );
+    const booking = match === -1 ? null : { bookingId: ids[match], checkOut: Number(bookings[match].checkOut) };
+    return { allowed: true, checkedAt, booking };
+  }
 
   return {
     address: ethers.getAddress(address),
@@ -84,10 +120,9 @@ async function connectChain({ provider, address, chainId, projectRoot, now = Dat
       const room = parseRoomId(roomId);
       const renter = parseWallet(wallet);
       const checkedAt = gatewaySeconds();
-      const allowed = await withTimeout(contract.hasAccess(room, renter, checkedAt), rpcTimeoutMs, "hasAccess");
-      return { allowed, checkedAt };
+      return withTimeout(pinnedRead(room, renter, checkedAt), rpcTimeoutMs, "checkAccess");
     },
   };
 }
 
-module.exports = { connectChain, GatewayStartupError };
+module.exports = { connectChain, GatewayStartupError, ChainIdentityError };

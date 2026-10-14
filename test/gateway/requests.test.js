@@ -354,6 +354,25 @@ describe("Gateway B2: request state machine", function () {
       expectCode(() => store.authorize(requestId, attempt), "EXPIRED");
     });
 
+    it("refuses consume at 5.0 s even when authorize succeeded at 4.9 s", function () {
+      const clocks = fakeClocks();
+      const store = newStore(clocks);
+      const { requestId, challenge } = readyToSign(store, clocks);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      clocks.advance(4_900);
+      store.authorize(requestId, attempt);
+      clocks.advance(100);
+      expectCode(() => store.consume(requestId, attempt), "EXPIRED");
+    });
+
+    it("returns the exact challenge it consumed when claiming verification", function () {
+      const clocks = fakeClocks();
+      const store = newStore(clocks);
+      const { requestId, challenge } = readyToSign(store, clocks);
+      const claim = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      expect(claim).to.include({ nonce: challenge.nonce, expiresAt: challenge.expiresAt, roomId: 101n, wallet: WALLET });
+    });
+
     it("ignores a late RPC success that arrives after the verifying deadline", async function () {
       const clocks = fakeClocks();
       const store = newStore(clocks);

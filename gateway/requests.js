@@ -140,11 +140,15 @@ function createRequestStore({
       expectState(req, ["CHALLENGE_ISSUED"]);
       expectSession(req, sessionId);
       if (typeof nonce !== "string" || nonce !== req.nonce) throw new RequestError("BAD_NONCE", "nonce is not current");
+      // Snapshot of the server-owned challenge being consumed, taken in the same
+      // synchronous step as the claim. The signature is checked against this,
+      // never against anything the client sends.
+      const challenge = { nonce: req.nonce, expiresAt: req.signExpiresAt };
       req.state = "VERIFYING";
       req.nonce = null; // consumed: no second attempt with the same nonce
       req.deadline = monoNow() + cfg.verifyMs;
       req.attempt = randomHex32();
-      return { attempt: req.attempt, roomId: req.roomId, wallet: req.wallet };
+      return { attempt: req.attempt, roomId: req.roomId, wallet: req.wallet, ...challenge };
     },
 
     // After the awaited checks passed. Re-checks state, deadline and attempt,

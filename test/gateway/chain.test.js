@@ -149,6 +149,55 @@ describe("Gateway B1: chain connection", function () {
       expect((await chain.checkAccess(ROOM, renter.address)).checkedAt).to.equal(checkIn + 123);
     });
 
+    it("returns the matching booking, read at the same block as hasAccess", async function () {
+      const { address, renter, checkIn, checkOut } = await deployWithStay();
+      const clock = fakeClock(0);
+      clock.setSeconds(checkIn + 60);
+      const chain = await connect(address, clock);
+      const result = await chain.checkAccess(ROOM, renter.address);
+      expect(result.allowed).to.equal(true);
+      expect(result.booking).to.deep.equal({ bookingId: 1n, checkOut });
+    });
+
+    it("returns no booking when access is denied", async function () {
+      const { address, other, checkIn } = await deployWithStay();
+      const clock = fakeClock(0);
+      clock.setSeconds(checkIn + 60);
+      const chain = await connect(address, clock);
+      expect((await chain.checkAccess(ROOM, other.address)).booking).to.equal(null);
+    });
+
+    it("re-checks the contract identity on every call, not only at startup", async function () {
+      const { address, renter, checkIn } = await deployWithStay();
+      const clock = fakeClock(0);
+      clock.setSeconds(checkIn + 60);
+      const chain = await connect(address, clock);
+      await reset();
+      await expect(chain.checkAccess(ROOM, renter.address)).to.be.rejectedWith(/no longer RentalBooking|no contract code/);
+      await ethers.deployContract("SimpleIoT"); // impostor at the same address
+      const err = await chain.checkAccess(ROOM, renter.address).catch((e) => e);
+      expect(err.code).to.equal("CHAIN_IDENTITY");
+    });
+
+    it("gives up on a hung RPC within its own timeout", async function () {
+      const { address, renter, checkIn } = await deployWithStay();
+      let hang = false;
+      const hangingProvider = new Proxy(ethers.provider, {
+        get(target, prop) {
+          if (prop === "call" && hang) return () => new Promise(() => {});
+          const value = Reflect.get(target, prop, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const clock = fakeClock(0);
+      clock.setSeconds(checkIn + 60);
+      const chain = await connect(address, clock, { provider: hangingProvider, rpcTimeoutMs: 300 });
+      hang = true;
+      const started = Date.now();
+      await expect(chain.checkAccess(ROOM, renter.address)).to.be.rejectedWith(/timed out after 300 ms/);
+      expect(Date.now() - started).to.be.within(250, 1500);
+    });
+
     it("rejects malformed wallets and room ids before calling the contract", async function () {
       const { address } = await deployWithStay();
       const chain = await connect(address, fakeClock(Date.now()));
