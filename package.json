@@ -4,21 +4,28 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "hardhat test",
     "chain": "hardhat node",
     "deploy": "hardhat run scripts/deploy.js --network localhost",
     "rent": "hardhat run scripts/rent.js --network localhost",
     "listen": "node listener.js",
     "mock-door": "node tools/mock-esp32.js",
-    "attack-test": "node tools/attack-test.js"
+    "attack-test": "node tools/attack-test.js",
+    "deploy-booking": "hardhat run scripts/deploy-booking.js --network localhost"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.0.8",
     "@nomicfoundation/hardhat-ethers": "^3.0.8",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.12",
+    "chai": "^4.5.0",
     "ethers": "^6.13.4",
     "hardhat": "^2.22.17"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.1.0"
   }
 }

@@ -107,7 +107,7 @@ CREATED 超過 30 秒、CHALLENGE_ISSUED 超過簽章期限 ──▶ EXPIRED　
 | 函式 | 呼叫者 | 規則 |
 |---|---|---|
 | `setRoom(roomId, pricePerNight, active)` | 房東 | 設定房價或停用房間；不影響已存在的訂房 |
-| `book(uint256 roomId, uint64 checkIn, uint64 checkOut, address renter)` | 任何人（付款） | `payer = msg.sender`，`renter` 由參數指定；`renter` 不可為零地址；房間必須是 active；`checkIn` 在未來；`checkOut - checkIn` 是整晚（86400 秒的倍數）且至少 1 晚；付款**剛好**等於晚數 × 房價；不能與同房間的占用日期重疊；同一房間的訂房數不超過 `MAX_BOOKINGS_PER_ROOM`（100）；發出 `Booked` 事件 |
+| `book(uint256 roomId, uint64 checkInTime, uint64 checkOutTime, address renter)` | 任何人（付款） | `payer = msg.sender`，`renter` 由參數指定；`renter` 不可為零地址；房間必須是 active；`checkIn` 在未來；`checkOut - checkIn` 是整晚（86400 秒的倍數）且至少 1 晚；付款**剛好**等於晚數 × 房價；不能與同房間的占用日期重疊；同一房間的訂房數不超過 `MAX_BOOKINGS_PER_ROOM`（100）；發出 `Booked` 事件 |
 | `cancel(bookingId)` | **只有付款人** | 只能在 `checkIn` 前；全額退款記入**付款人**（不是房客）的 `pendingWithdrawals`；狀態改為 `Cancelled`；發出 `Cancelled` 事件 |
 | `checkOut(bookingId)` | **只有房客** | 只能在 `checkIn` 之後、`checkOut` 之前；門禁立即失效；**不退款**；發出 `CheckedOut` 事件。房東**不能**替房客退房 |
 | `releaseRent(bookingId)` | 任何人 | `checkIn` 已過、未取消、`rentReleased == false` 時，把房租記入房東的 `pendingWithdrawals`，並設 `rentReleased = true` |
@@ -267,7 +267,7 @@ Unlock = {
 
 **v0.2**（依兩份審查與裁決修正）
 - 文件語言：繁體中文；程式識別字、API、Solidity 函式與技術術語保留英文。
-- `book(roomId, checkIn, checkOut, renter)`：`payer` 為退款對象，`renter` 為開門錢包；只有付款人能取消。
+- `book(roomId, checkInTime, checkOutTime, renter)`（參數不取名 `checkOut`，避免與 `checkOut()` 函式同名）：`payer` 為退款對象，`renter` 為開門錢包；只有付款人能取消。
 - 階段計時：感應 30 秒、簽章 30 秒（各自計時）、開門指令 5 秒；重發挑戰不延長期限。
 - 房東不能提前終止租約；緊急停權另行設計。
 - 合約：「日期占用」與「門禁有效」分開；提早退房不釋放日期；房東不能替房客退房；新增 `releaseRent` 與 `pendingWithdrawals` 統一結算；重入防護；訂房數上限；付款人與房客分開。

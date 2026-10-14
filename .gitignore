@@ -4,3 +4,4 @@ cache/
 deployed.json
 esp32/door_lock/secrets.h
 .env
+deployed-booking.json
