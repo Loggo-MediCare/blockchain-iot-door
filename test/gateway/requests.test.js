@@ -122,7 +122,7 @@ describe("Gateway B2: request state machine", function () {
       store.recordFob(requestId);
       const challenge = store.issueChallenge(requestId, SESSION);
       clocks.advance(29_999);
-      store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
       expect(store.get(requestId).state).to.equal("VERIFYING");
     });
 
@@ -213,15 +213,16 @@ describe("Gateway B2: request state machine", function () {
 
       // Same shape the B3 handler will have: take the state first, then await the chain.
       async function flow() {
+        let attempt;
         try {
-          store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+          ({ attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION }));
         } catch (err) {
           return `rejected:${err.code}`;
         }
         chainCalls++;
         await sleep(200); // slow hasAccess()
-        store.authorize(requestId);
-        return store.consume(requestId) ? "consumed" : "none";
+        store.authorize(requestId, attempt);
+        return store.consume(requestId, attempt) ? "consumed" : "none";
       }
 
       const results = await Promise.all([flow(), flow(), flow()]);
@@ -235,19 +236,19 @@ describe("Gateway B2: request state machine", function () {
       const clocks = fakeClocks();
       const store = newStore(clocks);
       const { requestId, challenge } = readyToSign(store, clocks);
-      store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
-      store.authorize(requestId);
-      const grant = store.consume(requestId);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      store.authorize(requestId, attempt);
+      const grant = store.consume(requestId, attempt);
       expect(grant).to.include({ requestId, roomId: 101n, wallet: WALLET });
-      expectCode(() => store.consume(requestId), "WRONG_STATE");
+      expectCode(() => store.consume(requestId, attempt), "WRONG_STATE");
     });
 
     it("refuses to consume while still VERIFYING (no grant without the chain check)", function () {
       const clocks = fakeClocks();
       const store = newStore(clocks);
       const { requestId, challenge } = readyToSign(store, clocks);
-      store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
-      expectCode(() => store.consume(requestId), "WRONG_STATE");
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      expectCode(() => store.consume(requestId, attempt), "WRONG_STATE");
       expect(store.get(requestId).state).to.equal("VERIFYING");
     });
 
@@ -265,7 +266,7 @@ describe("Gateway B2: request state machine", function () {
       const clocks = fakeClocks();
       const store = newStore(clocks);
       const { requestId, challenge } = readyToSign(store, clocks);
-      store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
       store.reject(requestId, "RPC timeout");
       expect(store.get(requestId)).to.include({ state: "REJECTED", reason: "RPC timeout" });
       expectCode(() => store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION }), "WRONG_STATE");
@@ -276,39 +277,39 @@ describe("Gateway B2: request state machine", function () {
       const clocks = fakeClocks();
       const store = newStore(clocks);
       const { requestId, challenge } = readyToSign(store, clocks);
-      store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
       clocks.advance(5_000);
       expect(store.get(requestId).state).to.equal("EXPIRED");
-      expectCode(() => store.authorize(requestId), "EXPIRED");
+      expectCode(() => store.authorize(requestId, attempt), "EXPIRED");
     });
 
     it("refuses to consume once the request has expired, even if AUTHORIZED", function () {
       const clocks = fakeClocks();
       const store = newStore(clocks);
       const { requestId, challenge } = readyToSign(store, clocks);
-      store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
-      store.authorize(requestId);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      store.authorize(requestId, attempt);
       clocks.advance(5_000);
-      expectCode(() => store.consume(requestId), "EXPIRED");
+      expectCode(() => store.consume(requestId, attempt), "EXPIRED");
     });
 
     it("refuses to consume a revoked request", function () {
       const clocks = fakeClocks();
       const store = newStore(clocks);
       const { requestId, challenge } = readyToSign(store, clocks);
-      store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
-      store.authorize(requestId);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      store.authorize(requestId, attempt);
       store.reject(requestId, "revoked by admin");
-      expectCode(() => store.consume(requestId), "WRONG_STATE");
+      expectCode(() => store.consume(requestId, attempt), "WRONG_STATE");
     });
 
     it("keeps terminal states terminal", function () {
       const clocks = fakeClocks();
       const store = newStore(clocks);
       const { requestId, challenge } = readyToSign(store, clocks);
-      store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
-      store.authorize(requestId);
-      store.consume(requestId);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      store.authorize(requestId, attempt);
+      store.consume(requestId, attempt);
       expectCode(() => store.reject(requestId, "late"), "WRONG_STATE");
       expect(store.get(requestId).state).to.equal("CONSUMED");
     });
@@ -322,6 +323,93 @@ describe("Gateway B2: request state machine", function () {
       clocks.mono -= 60_000; // even if the clock source misbehaved later
       expectCode(() => store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION }), "EXPIRED");
       expect(store.get(requestId).state).to.equal("EXPIRED");
+    });
+  });
+
+  describe("verification deadline and stale results (attempt token)", function () {
+    it("returns a fresh 32-byte attempt token for each verification claim", function () {
+      const clocks = fakeClocks();
+      const store = newStore(clocks);
+      const { requestId, challenge } = readyToSign(store, clocks);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      expect(attempt).to.match(/^0x[0-9a-f]{64}$/);
+    });
+
+    it("authorizes when verification completes at 4.999 s", function () {
+      const clocks = fakeClocks();
+      const store = newStore(clocks);
+      const { requestId, challenge } = readyToSign(store, clocks);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      clocks.advance(4_999);
+      store.authorize(requestId, attempt);
+      expect(store.consume(requestId, attempt)).to.include({ requestId });
+    });
+
+    it("rejects authorization at exactly 5 s", function () {
+      const clocks = fakeClocks();
+      const store = newStore(clocks);
+      const { requestId, challenge } = readyToSign(store, clocks);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      clocks.advance(5_000);
+      expectCode(() => store.authorize(requestId, attempt), "EXPIRED");
+    });
+
+    it("ignores a late RPC success that arrives after the verifying deadline", async function () {
+      const clocks = fakeClocks();
+      const store = newStore(clocks);
+      const { requestId, challenge } = readyToSign(store, clocks);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+
+      let resolveRpc;
+      const rpc = new Promise((r) => (resolveRpc = r));
+      const flow = (async () => {
+        const allowed = await rpc; // hung hasAccess()
+        if (!allowed) return "denied";
+        // Report which layer refuses: authorize() must stop it by itself,
+        // not rely on consume() catching it afterwards.
+        try {
+          store.authorize(requestId, attempt);
+        } catch (err) {
+          return `authorize refused:${err.code}`;
+        }
+        try {
+          return store.consume(requestId, attempt) ? "consumed" : "none";
+        } catch (err) {
+          return `consume refused:${err.code}`;
+        }
+      })();
+
+      // The deadline passes while the RPC is still pending. Nothing touches the
+      // store in between (no polling): reading it here would mark the request
+      // EXPIRED early and hide a missing expiry check in authorize().
+      clocks.advance(5_000);
+      resolveRpc(true); // ...and then it reports success
+      expect(await flow).to.equal("authorize refused:EXPIRED");
+      expect(store.get(requestId).state).to.equal("EXPIRED");
+    });
+
+    it("refuses a result that carries a different attempt token", function () {
+      const clocks = fakeClocks();
+      const store = newStore(clocks);
+      const { requestId, challenge } = readyToSign(store, clocks);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      expectCode(() => store.authorize(requestId, "0x" + "00".repeat(32)), "BAD_ATTEMPT");
+      expectCode(() => store.authorize(requestId, undefined), "BAD_ATTEMPT");
+      expect(store.get(requestId).state).to.equal("VERIFYING");
+      store.authorize(requestId, attempt);
+      expectCode(() => store.consume(requestId, "0x" + "11".repeat(32)), "BAD_ATTEMPT");
+      expect(store.get(requestId).state).to.equal("AUTHORIZED");
+    });
+
+    it("a CONSUMED request cannot be authorized or consumed again", function () {
+      const clocks = fakeClocks();
+      const store = newStore(clocks);
+      const { requestId, challenge } = readyToSign(store, clocks);
+      const { attempt } = store.beginVerify(requestId, { nonce: challenge.nonce, sessionId: SESSION });
+      store.authorize(requestId, attempt);
+      store.consume(requestId, attempt);
+      expectCode(() => store.authorize(requestId, attempt), "WRONG_STATE");
+      expectCode(() => store.consume(requestId, attempt), "WRONG_STATE");
     });
   });
 

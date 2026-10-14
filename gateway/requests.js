@@ -73,11 +73,21 @@ function createRequestStore({
     if (sessionId !== req.sessionId) throw new RequestError("WRONG_SESSION", "request belongs to another session");
   }
 
+  // Each verification claim gets its own token. Results from the async chain
+  // check must present it, so a stale result can never authorize anything
+  // other than the claim that started it.
+  function expectAttempt(req, attempt) {
+    if (typeof attempt !== "string" || attempt !== req.attempt) {
+      throw new RequestError("BAD_ATTEMPT", "result does not belong to the current verification attempt");
+    }
+  }
+
   function finish(req, state, reason) {
     req.state = state;
     req.reason = reason;
     req.finishedAt = monoNow();
     req.nonce = null;
+    req.attempt = null;
   }
 
   return {
@@ -133,22 +143,26 @@ function createRequestStore({
       req.state = "VERIFYING";
       req.nonce = null; // consumed: no second attempt with the same nonce
       req.deadline = monoNow() + cfg.verifyMs;
-      return { roomId: req.roomId, wallet: req.wallet };
+      req.attempt = randomHex32();
+      return { attempt: req.attempt, roomId: req.roomId, wallet: req.wallet };
     },
 
-    // After the awaited checks passed. Re-checks state and deadline.
-    authorize(requestId) {
+    // After the awaited checks passed. Re-checks state, deadline and attempt,
+    // so a late result (after the 5 s deadline) is refused.
+    authorize(requestId, attempt) {
       const req = load(requestId);
       expectState(req, ["VERIFYING"]);
+      expectAttempt(req, attempt);
       req.state = "AUTHORIZED";
     },
 
     // Returns the one and only grant for this request; call before building
     // the unlock command. If sending that command fails, the request stays
     // CONSUMED: a new command needs a new request.
-    consume(requestId) {
+    consume(requestId, attempt) {
       const req = load(requestId);
       expectState(req, ["AUTHORIZED"]);
+      expectAttempt(req, attempt);
       finish(req, "CONSUMED");
       return { requestId, roomId: req.roomId, wallet: req.wallet };
     },
