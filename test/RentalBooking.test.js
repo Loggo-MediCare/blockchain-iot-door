@@ -241,19 +241,55 @@ describe("RentalBooking", function () {
   });
 
   describe("limits", function () {
-    it("caps bookings per room and reports the worst-case gas", async function () {
+    async function fillRoom(booking, payer, renter, day0) {
+      const max = Number(await booking.MAX_ACTIVE_BOOKINGS_PER_ROOM());
+      const stays = [];
+      for (let day = 0; day < max; day++) stays.push(await book(booking, payer, renter, day0, day, 1));
+      return { max, stays };
+    }
+
+    it("caps active bookings per room and reports the worst-case gas", async function () {
       const { booking, payer, renter, day0 } = await loadFixture(deployFixture);
-      const max = Number(await booking.MAX_BOOKINGS_PER_ROOM());
-      let last;
-      for (let day = 0; day < max; day++) {
-        last = await book(booking, payer, renter, day0, day, 1);
-      }
-      console.log(`      gas for booking #${max} (scans ${max - 1} existing): ${last.receipt.gasUsed}`);
+      const { max, stays } = await fillRoom(booking, payer, renter, day0);
+      const last = stays[max - 1];
+      console.log(`      gas for booking #${max} (scans ${max - 1} active): ${last.receipt.gasUsed}`);
       expect(last.receipt.gasUsed).to.be.lessThan(1_000_000n);
 
       await expect(
         booking.connect(payer).book(ROOM, day0 + max * NIGHT, day0 + (max + 1) * NIGHT, renter.address, { value: PRICE })
       ).to.be.revertedWithCustomError(booking, "RoomFull");
+    });
+
+    it("does not let finished stays fill the room", async function () {
+      const { booking, payer, renter, other, day0 } = await loadFixture(deployFixture);
+      const { max, stays } = await fillRoom(booking, payer, renter, day0);
+      await time.increaseTo(stays[max - 1].checkOut + 3600); // every stay has ended
+
+      const next = await book(booking, other, other, day0, max + 1, 1);
+      console.log(`      gas for the booking that pruned ${max} finished stays: ${next.receipt.gasUsed}`);
+      expect(await booking.getActiveBookingIds(ROOM)).to.deep.equal([next.id]);
+      // History is still readable.
+      expect((await booking.getBooking(stays[0].id)).renter).to.equal(renter.address);
+    });
+
+    it("frees a slot when a booking is cancelled", async function () {
+      const { booking, payer, renter, other, day0 } = await loadFixture(deployFixture);
+      const { max, stays } = await fillRoom(booking, payer, renter, day0);
+      await booking.connect(payer).cancel(stays[max - 1].id);
+      await book(booking, other, other, day0, max - 1, 1); // the cancelled night is free again
+    });
+
+    it("keeps an early-checkout stay counted until its check-out time", async function () {
+      const { booking, payer, renter, other, day0 } = await loadFixture(deployFixture);
+      const { id, checkIn, checkOut } = await book(booking, payer, renter, day0, 0, 3);
+      await time.increaseTo(checkIn + 3600);
+      await booking.connect(renter).checkOut(id);
+      await book(booking, other, other, day0, 5, 1); // prunes nothing: the stay still holds its dates
+      expect(await booking.getActiveBookingIds(ROOM)).to.have.lengthOf(2);
+      await time.increaseTo(checkOut);
+      const later = await book(booking, other, other, day0, 7, 1);
+      expect(await booking.getActiveBookingIds(ROOM)).to.not.include(id);
+      expect(await booking.hasAccess(ROOM, other.address, later.checkIn)).to.equal(true);
     });
   });
 });

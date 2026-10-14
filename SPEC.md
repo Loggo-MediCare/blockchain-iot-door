@@ -74,16 +74,24 @@ ESP32-CAM + RC522（讀鑰匙圈）＋ 門鎖（LED 模擬）
 ```
 CREATED ──鑰匙圈事件配對成功──▶ FOB_VERIFIED ──發出挑戰──▶ CHALLENGE_ISSUED
                                                               │  ▲
-                                               簽章驗證成功 │  │ 重發挑戰（舊 nonce 作廢，最多 3 次，不延長期限）
+                                         收到簽章，搶到驗證權 │  │ 重發挑戰（舊 nonce 作廢，最多 3 次，不延長期限）
                                                               ▼  │
-                                                          AUTHORIZED ──送出開門指令──▶ CONSUMED
+                                                          VERIFYING ──簽章與 hasAccess 都通過──▶ AUTHORIZED ──搶到發送權──▶ CONSUMED ──▶ 送出開門指令
 
 CREATED 超過 30 秒、CHALLENGE_ISSUED 超過簽章期限 ──▶ EXPIRED　　任何狀態 ──驗證失敗──▶ REJECTED
 ```
 
-- 每個狀態轉移都是**比對後設定**（compare-and-set）：只有在目前狀態符合預期時才轉移，否則失敗。
-- 每筆請求**最多只能開門一次**。同一個挑戰同時送兩次，只有一次會成功。
-- 原型閘道是單一 Node.js 程序，狀態轉移在同一個同步區塊內完成就是原子的。若之後改成多個閘道程序，必須改用資料庫交易。
+**原子性規則**
+
+驗證流程中有**非同步步驟**（查詢合約的 `hasAccess`、送出開門指令）。只靠「單一 Node.js 程序」不夠：在 `await` 等待期間，另一個並行請求可能讀到同樣的舊狀態，兩個都通過驗證。因此：
+
+1. **先轉移，再等待。** 收到簽章時，在**任何 `await` 之前**，以同步的比對後設定（compare-and-set）把 `CHALLENGE_ISSUED` 轉為 `VERIFYING`，並同時把 nonce 標記為已使用。只有轉移成功的那一個呼叫能繼續；其他並行呼叫立即被拒絕。
+2. **`await` 之後不依賴舊狀態。** 查完合約後，要再用比對後設定把 `VERIFYING` 轉為 `AUTHORIZED`；轉移失敗（例如請求已逾時或被取消）就停止。
+3. **送出指令前先標記。** 把 `AUTHORIZED` 轉為 `CONSUMED` 之後，才送出開門指令。送出失敗不會讓請求回到可用狀態；房客需要重新開始。
+4. **驗證中的失敗一律終止。** `VERIFYING` 期間任何失敗（簽章錯誤、`hasAccess` 為 false、RPC 錯誤或逾時）都轉為 `REJECTED`，不會回到 `CHALLENGE_ISSUED`，避免同一個 nonce 被再次嘗試。
+5. **多個閘道程序時**，比對後設定必須由資料庫完成，例如 `UPDATE requests SET state = 'VERIFYING' WHERE id = ? AND state = 'CHALLENGE_ISSUED'`，以影響列數是否為 1 判斷是否搶到。
+
+每筆請求**最多只能開門一次**。同一個挑戰同時送兩次，只有一次會成功。
 
 ## 6. 訂房合約（階段 A）
 
@@ -107,13 +115,14 @@ CREATED 超過 30 秒、CHALLENGE_ISSUED 超過簽章期限 ──▶ EXPIRED　
 | 函式 | 呼叫者 | 規則 |
 |---|---|---|
 | `setRoom(roomId, pricePerNight, active)` | 房東 | 設定房價或停用房間；不影響已存在的訂房 |
-| `book(uint256 roomId, uint64 checkInTime, uint64 checkOutTime, address renter)` | 任何人（付款） | `payer = msg.sender`，`renter` 由參數指定；`renter` 不可為零地址；房間必須是 active；`checkIn` 在未來；`checkOut - checkIn` 是整晚（86400 秒的倍數）且至少 1 晚；付款**剛好**等於晚數 × 房價；不能與同房間的占用日期重疊；同一房間的訂房數不超過 `MAX_BOOKINGS_PER_ROOM`（100）；發出 `Booked` 事件 |
+| `book(uint256 roomId, uint64 checkInTime, uint64 checkOutTime, address renter)` | 任何人（付款） | `payer = msg.sender`，`renter` 由參數指定；`renter` 不可為零地址；房間必須是 active；`checkIn` 在未來；`checkOut - checkIn` 是整晚（86400 秒的倍數）且至少 1 晚；付款**剛好**等於晚數 × 房價；不能與同房間的占用日期重疊；同一房間**仍占用日期**的訂房（未取消、`checkOut` 尚未到）不超過 `MAX_ACTIVE_BOOKINGS_PER_ROOM`（100）；發出 `Booked` 事件 |
 | `cancel(bookingId)` | **只有付款人** | 只能在 `checkIn` 前；全額退款記入**付款人**（不是房客）的 `pendingWithdrawals`；狀態改為 `Cancelled`；發出 `Cancelled` 事件 |
 | `checkOut(bookingId)` | **只有房客** | 只能在 `checkIn` 之後、`checkOut` 之前；門禁立即失效；**不退款**；發出 `CheckedOut` 事件。房東**不能**替房客退房 |
 | `releaseRent(bookingId)` | 任何人 | `checkIn` 已過、未取消、`rentReleased == false` 時，把房租記入房東的 `pendingWithdrawals`，並設 `rentReleased = true` |
 | `withdraw()` | 任何有餘額的地址 | 先把餘額歸零，再轉帳（checks-effects-interactions），並加上重入防護；餘額為 0 時失敗 |
 | `hasAccess(roomId, wallet, time)` | 任何人（唯讀） | 依 6.2「門禁有效」判斷，`renter == wallet` |
 | `getBooking(bookingId)` | 任何人（唯讀） | 回傳訂房完整資料，供閘道使用 |
+| `getActiveBookingIds(roomId)` | 任何人（唯讀） | 回傳仍占用日期的訂房 ID |
 
 Solidity 的外部函式參數不能設預設值。付款人自己入住時，由前端把 `renter` 設為 `msg.sender`；MVP 不使用函式多載，避免 ABI 出現兩個同名函式。
 
@@ -126,7 +135,9 @@ Solidity 的外部函式參數不能設預設值。付款人自己入住時，�
 
 ### 6.5 已知取捨
 
-重疊檢查會逐筆掃描同房間的訂房。以 `MAX_BOOKINGS_PER_ROOM` 限制數量，並在測試中量測最壞情況的 gas。正式版要改用按日期索引的資料結構。
+合約為每個房間維護一份「仍占用日期」的訂房清單。`book()` 掃描這份清單時，會順便移除已取消或已結束的訂房，所以**歷史訂房不會占用上限**；完整歷史仍保存在 `getBooking` 和事件裡。清單長度上限是 `MAX_ACTIVE_BOOKINGS_PER_ROOM`，掃描成本因此有上限；測試會量測最壞情況的 gas。正式版要改用按日期索引的資料結構。
+
+`hasAccess` 只掃描這份清單，所以**只適用於現在或未來的時間**；查詢過去的時間可能回傳 false。閘道只用它判斷「現在」，不受影響。
 
 ## 7. EIP-712 開門授權
 
@@ -226,7 +237,10 @@ Unlock = {
 - `hasAccess`：租期前 false、租期內 true、`checkOut` 時間到 false、取消後 false、別人的錢包 false。
 - `checkIn` 前不能 `releaseRent`；同一筆不能 release 兩次；取消的訂房不能 release。
 - **退款或房租提領兩次，第二次失敗**；重入攻擊合約無法多領。
-- 訂房數達到上限時被拒絕；量測上限時 `book()` 的 gas，並寫進測試輸出。
+- 仍占用日期的訂房達到上限時被拒絕；量測上限時 `book()` 的 gas，並寫進測試輸出。
+- **100 筆訂房全部結束後，仍可接受新訂房**（歷史不占上限），且舊訂房仍查得到。
+- 取消一筆訂房後，上限空出一個位置。
+- 提早退房的訂房在原定 `checkOut` 之前仍計入占用。
 
 ### 階段 B（閘道 API，鑰匙圈事件與開門指令先用模擬）
 
@@ -234,7 +248,8 @@ Unlock = {
 - 簽章地址不符、房號不符、`chainId` 錯誤、合約地址錯誤、`nonce` 重用、超過簽章階段期限：都被拒絕。
 - 沒有有效訂房，或**簽章有效但訂房剛被取消**：被拒絕。
 - **請求建立後，替換錢包或房號再送簽章**：被拒絕。
-- **同一個挑戰同時送兩次**：只有一次成功。
+- **同一個挑戰同時送兩次**：只有一次成功。測試時要讓合約查詢**人為延遲**（例如 200 毫秒），確認在 `await` 期間到達的第二個請求也會被拒絕。
+- `VERIFYING` 期間 RPC 失敗：請求轉為 `REJECTED`，同一個 nonce 不能再用。
 - 重發挑戰後，舊的 nonce 被拒絕；超過 3 次重發被拒絕；重發的挑戰不延長簽章期限。
 - **階段計時：** 建立請求 30 秒內沒有感應則逾時；在第 29 秒感應，仍有完整 30 秒可以簽章；簽章超過期限被拒絕；開門指令超過 5 秒被 ESP32（模擬）拒絕。
 - 沒有鑰匙圈事件，或事件 HMAC 錯誤、序號重用：被拒絕。
@@ -266,6 +281,8 @@ Unlock = {
 ## 16. 版本紀錄
 
 **v0.2**（依兩份審查與裁決修正）
+- 合約上限改為只計算仍占用日期的訂房，`book()` 順便移除已取消或已結束的訂房；新增 `getActiveBookingIds`。
+- 狀態機新增 `VERIFYING`；明定「先轉移、再 `await`」的原子性規則，以及多程序時的資料庫做法。
 - 文件語言：繁體中文；程式識別字、API、Solidity 函式與技術術語保留英文。
 - `book(roomId, checkInTime, checkOutTime, renter)`（參數不取名 `checkOut`，避免與 `checkOut()` 函式同名）：`payer` 為退款對象，`renter` 為開門錢包；只有付款人能取消。
 - 階段計時：感應 30 秒、簽章 30 秒（各自計時）、開門指令 5 秒；重發挑戰不延長期限。

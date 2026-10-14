@@ -8,7 +8,9 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 // requires a Booked booking for that renter whose stay covers the given time.
 contract RentalBooking is ReentrancyGuard {
     uint256 public constant NIGHT = 1 days;
-    uint256 public constant MAX_BOOKINGS_PER_ROOM = 100;
+    // Cap on bookings that still hold dates (current or future). Finished and
+    // cancelled bookings are pruned, so history never fills a room.
+    uint256 public constant MAX_ACTIVE_BOOKINGS_PER_ROOM = 100;
 
     enum Status {
         Booked,
@@ -37,7 +39,9 @@ contract RentalBooking is ReentrancyGuard {
 
     mapping(uint256 => Room) public rooms;
     mapping(uint256 => Booking) private bookings;
-    mapping(uint256 => uint256[]) private roomBookingIds;
+    // Bookings that may still occupy dates; finished and cancelled ones are
+    // removed lazily in book(). Full history stays in `bookings` and in events.
+    mapping(uint256 => uint256[]) private activeBookingIds;
     mapping(address => uint256) public pendingWithdrawals;
 
     event RoomSet(uint256 indexed roomId, uint256 pricePerNight, bool active);
@@ -102,16 +106,22 @@ contract RentalBooking is ReentrancyGuard {
         uint256 expected = ((checkOutTime - checkInTime) / NIGHT) * room.pricePerNight;
         if (msg.value != expected) revert WrongPayment(expected, msg.value);
 
-        uint256[] storage ids = roomBookingIds[roomId];
-        if (ids.length >= MAX_BOOKINGS_PER_ROOM) revert RoomFull();
-        // Occupancy: every booking that is not cancelled holds its dates,
-        // including ones checked out early (SPEC 6.2).
-        for (uint256 i = 0; i < ids.length; i++) {
+        uint256[] storage ids = activeBookingIds[roomId];
+        // One pass: drop bookings that can no longer occupy any date (cancelled,
+        // or already ended; the new check-in is in the future), and check the
+        // rest for overlap. Checked-out bookings keep their dates (SPEC 6.2).
+        uint256 i = 0;
+        while (i < ids.length) {
             Booking storage other = bookings[ids[i]];
-            if (other.status != Status.Cancelled && checkInTime < other.checkOut && other.checkIn < checkOutTime) {
-                revert Overlap(ids[i]);
+            if (other.status == Status.Cancelled || other.checkOut <= block.timestamp) {
+                ids[i] = ids[ids.length - 1];
+                ids.pop();
+                continue;
             }
+            if (checkInTime < other.checkOut && other.checkIn < checkOutTime) revert Overlap(ids[i]);
+            i++;
         }
+        if (ids.length >= MAX_ACTIVE_BOOKINGS_PER_ROOM) revert RoomFull();
 
         bookingId = nextBookingId++;
         bookings[bookingId] = Booking(msg.sender, renter, roomId, checkInTime, checkOutTime, msg.value, Status.Booked, false);
@@ -160,8 +170,10 @@ contract RentalBooking is ReentrancyGuard {
     }
 
     // Gateway check (SPEC 6.2 "access"): Booked, renter matches, time inside [checkIn, checkOut).
+    // Meant for the current time: bookings that ended before the last prune are
+    // no longer scanned, so past times may return false.
     function hasAccess(uint256 roomId, address wallet, uint256 time) external view returns (bool) {
-        uint256[] storage ids = roomBookingIds[roomId];
+        uint256[] storage ids = activeBookingIds[roomId];
         for (uint256 i = 0; i < ids.length; i++) {
             Booking storage b = bookings[ids[i]];
             if (b.status == Status.Booked && b.renter == wallet && b.checkIn <= time && time < b.checkOut) {
@@ -175,8 +187,8 @@ contract RentalBooking is ReentrancyGuard {
         return _existing(bookingId);
     }
 
-    function getRoomBookingIds(uint256 roomId) external view returns (uint256[] memory) {
-        return roomBookingIds[roomId];
+    function getActiveBookingIds(uint256 roomId) external view returns (uint256[] memory) {
+        return activeBookingIds[roomId];
     }
 
     function _existing(uint256 bookingId) private view returns (Booking storage b) {
