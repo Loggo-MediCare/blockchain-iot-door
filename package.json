@@ -11,7 +11,8 @@
     "listen": "node listener.js",
     "mock-door": "node tools/mock-esp32.js",
     "attack-test": "node tools/attack-test.js",
-    "deploy-booking": "hardhat run scripts/deploy-booking.js --network localhost"
+    "deploy-booking": "hardhat run scripts/deploy-booking.js --network localhost",
+    "gateway-check": "node scripts/gateway-check.js"
   },
   "keywords": [],
   "author": "",
