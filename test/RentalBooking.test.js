@@ -142,8 +142,25 @@ describe("RentalBooking", function () {
       const { booking, payer, renter, other, day0 } = await loadFixture(deployFixture);
       const { id, checkIn } = await book(booking, payer, renter, day0, 0, 1);
       await expect(booking.connect(other).cancel(id)).to.be.revertedWithCustomError(booking, "NotPayer");
-      await time.increaseTo(checkIn);
+      await time.setNextBlockTimestamp(checkIn); // the exact check-in second
       await expect(booking.connect(payer).cancel(id)).to.be.revertedWithCustomError(booking, "TooLateToCancel");
+    });
+
+    it("still allows cancelling in the last second before check-in", async function () {
+      const { booking, payer, renter, day0 } = await loadFixture(deployFixture);
+      const { id, checkIn } = await book(booking, payer, renter, day0, 0, 1);
+      await time.setNextBlockTimestamp(checkIn - 1);
+      await expect(booking.connect(payer).cancel(id)).to.emit(booking, "Cancelled");
+    });
+
+    it("refunds only once and only to the payer", async function () {
+      const { booking, payer, renter, day0 } = await loadFixture(deployFixture);
+      const { id } = await book(booking, payer, renter, day0, 0, 2);
+      await booking.connect(payer).cancel(id);
+      await expect(booking.connect(payer).cancel(id)).to.be.revertedWithCustomError(booking, "NotBooked");
+      expect(await booking.pendingWithdrawals(payer.address)).to.equal(PRICE * 2n);
+      await expect(booking.connect(renter).withdraw()).to.be.revertedWithCustomError(booking, "NothingToWithdraw");
+      await expect(booking.connect(payer).withdraw()).to.changeEtherBalances([payer, booking], [PRICE * 2n, -PRICE * 2n]);
     });
   });
 
@@ -169,8 +186,32 @@ describe("RentalBooking", function () {
       const { booking, payer, renter, day0 } = await loadFixture(deployFixture);
       const { id, checkOut } = await book(booking, payer, renter, day0, 0, 1);
       await expect(booking.connect(renter).checkOut(id)).to.be.revertedWithCustomError(booking, "NotDuringStay");
-      await time.increaseTo(checkOut);
+      await time.setNextBlockTimestamp(checkOut); // the exact check-out second
       await expect(booking.connect(renter).checkOut(id)).to.be.revertedWithCustomError(booking, "NotDuringStay");
+    });
+
+    it("works at the first and the last second of the stay", async function () {
+      const { booking, payer, renter, day0 } = await loadFixture(deployFixture);
+      const first = await book(booking, payer, renter, day0, 0, 1);
+      await time.setNextBlockTimestamp(first.checkIn);
+      await expect(booking.connect(renter).checkOut(first.id)).to.emit(booking, "CheckedOut");
+
+      const second = await book(booking, payer, renter, day0, 2, 1);
+      await time.setNextBlockTimestamp(second.checkOut - 1);
+      await expect(booking.connect(renter).checkOut(second.id)).to.emit(booking, "CheckedOut");
+    });
+
+    it("cannot check out twice, and early checkout refunds nothing", async function () {
+      const { booking, owner, payer, renter, day0 } = await loadFixture(deployFixture);
+      const { id, checkIn } = await book(booking, payer, renter, day0, 0, 3);
+      await time.increaseTo(checkIn + 3600);
+      await booking.connect(renter).checkOut(id);
+      await expect(booking.connect(renter).checkOut(id)).to.be.revertedWithCustomError(booking, "NotBooked");
+      await expect(booking.connect(payer).cancel(id)).to.be.revertedWithCustomError(booking, "NotBooked");
+      expect(await booking.pendingWithdrawals(payer.address)).to.equal(0);
+      // The full rent is still due to the owner (MVP policy, SPEC 6.4).
+      await expect(booking.releaseRent(id)).to.emit(booking, "RentReleased").withArgs(id, PRICE * 3n);
+      expect(await booking.pendingWithdrawals(owner.address)).to.equal(PRICE * 3n);
     });
   });
 
@@ -186,6 +227,25 @@ describe("RentalBooking", function () {
       expect(await booking.hasAccess(ROOM + 1, renter.address, checkIn)).to.equal(false);
     });
 
+    it("tracks two stays by the same renter, with a gap between them", async function () {
+      const { booking, payer, renter, day0 } = await loadFixture(deployFixture);
+      const a = await book(booking, payer, renter, day0, 0, 1);
+      const b = await book(booking, payer, renter, day0, 2, 1);
+      expect(await booking.hasAccess(ROOM, renter.address, a.checkIn)).to.equal(true);
+      expect(await booking.hasAccess(ROOM, renter.address, a.checkOut)).to.equal(false); // the gap night
+      expect(await booking.hasAccess(ROOM, renter.address, b.checkIn)).to.equal(true);
+    });
+
+    it("documented limit: past times read false once a finished stay is pruned", async function () {
+      const { booking, payer, renter, other, day0 } = await loadFixture(deployFixture);
+      const old = await book(booking, payer, renter, day0, 0, 1);
+      expect(await booking.hasAccess(ROOM, renter.address, old.checkIn)).to.equal(true);
+      await time.increaseTo(old.checkOut + 3600);
+      await book(booking, other, other, day0, 3, 1); // prunes the finished stay
+      // Same past time, now false: hasAccess is only valid for the current time (SPEC 6.5).
+      expect(await booking.hasAccess(ROOM, renter.address, old.checkIn)).to.equal(false);
+    });
+
     it("is false after cancellation", async function () {
       const { booking, payer, renter, day0 } = await loadFixture(deployFixture);
       const { id, checkIn } = await book(booking, payer, renter, day0, 0, 1);
@@ -198,8 +258,9 @@ describe("RentalBooking", function () {
     it("releases rent to the owner only after check-in, once", async function () {
       const { booking, owner, payer, renter, other, day0 } = await loadFixture(deployFixture);
       const { id, checkIn } = await book(booking, payer, renter, day0, 0, 2);
+      await time.setNextBlockTimestamp(checkIn - 1);
       await expect(booking.connect(other).releaseRent(id)).to.be.revertedWithCustomError(booking, "RentNotDue");
-      await time.increaseTo(checkIn);
+      await time.setNextBlockTimestamp(checkIn); // due from the exact check-in second
       await expect(booking.connect(other).releaseRent(id)).to.emit(booking, "RentReleased").withArgs(id, PRICE * 2n);
       await expect(booking.connect(other).releaseRent(id)).to.be.revertedWithCustomError(booking, "RentAlreadyReleased");
       expect(await booking.pendingWithdrawals(owner.address)).to.equal(PRICE * 2n);
@@ -229,14 +290,24 @@ describe("RentalBooking", function () {
 
     it("blocks a reentrancy attack on withdraw", async function () {
       const { booking, payer, renter, day0 } = await loadFixture(deployFixture);
-      await book(booking, payer, renter, day0, 5, 1); // other funds held by the contract
+      await book(booking, payer, renter, day0, 5, 1); // other people's money held by the contract
       const attacker = await ethers.deployContract("ReentrantWithdrawer", [await booking.getAddress()]);
+      const attackerAddress = await attacker.getAddress();
       await attacker.bookAndCancel(ROOM, day0, day0 + NIGHT, { value: PRICE });
 
-      const before = await ethers.provider.getBalance(await booking.getAddress());
-      await expect(attacker.attack()).to.be.revertedWithCustomError(booking, "TransferFailed");
-      expect(await ethers.provider.getBalance(await booking.getAddress())).to.equal(before);
-      expect(await booking.pendingWithdrawals(await attacker.getAddress())).to.equal(PRICE);
+      // The outer withdrawal succeeds and pays exactly one refund.
+      await expect(attacker.attack()).to.changeEtherBalances([attacker, booking], [PRICE, -PRICE]);
+      expect(await attacker.timesPaid()).to.equal(1);
+      expect(await booking.pendingWithdrawals(attackerAddress)).to.equal(0);
+
+      // The re-entry really happened and was stopped by OpenZeppelin's guard,
+      // not by some other failure.
+      expect(await attacker.reentryAttempts()).to.equal(1);
+      const guardError = ethers.id("ReentrancyGuardReentrantCall()").slice(0, 10);
+      expect(await attacker.lastReentryError()).to.equal(guardError);
+
+      // The other booking's funds are untouched.
+      expect(await ethers.provider.getBalance(await booking.getAddress())).to.equal(PRICE);
     });
   });
 
@@ -267,6 +338,7 @@ describe("RentalBooking", function () {
 
       const next = await book(booking, other, other, day0, max + 1, 1);
       console.log(`      gas for the booking that pruned ${max} finished stays: ${next.receipt.gasUsed}`);
+      expect(next.receipt.gasUsed).to.be.lessThan(1_200_000n);
       expect(await booking.getActiveBookingIds(ROOM)).to.deep.equal([next.id]);
       // History is still readable.
       expect((await booking.getBooking(stays[0].id)).renter).to.equal(renter.address);

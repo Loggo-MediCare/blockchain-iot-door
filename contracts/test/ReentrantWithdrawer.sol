@@ -8,10 +8,14 @@ interface IRentalBooking {
 }
 
 // Test-only attacker: books, cancels, then tries to withdraw its refund twice
-// by calling withdraw() again from inside receive().
+// by calling withdraw() again from inside receive(). The nested call is wrapped
+// in try/catch so the outer withdrawal can still finish, and the reason the
+// nested call failed is recorded for the test to inspect.
 contract ReentrantWithdrawer {
     IRentalBooking public immutable target;
     uint256 public reentryAttempts;
+    uint256 public timesPaid;
+    bytes public lastReentryError;
 
     constructor(address target_) {
         target = IRentalBooking(target_);
@@ -27,7 +31,12 @@ contract ReentrantWithdrawer {
     }
 
     receive() external payable {
+        timesPaid++;
         reentryAttempts++;
-        target.withdraw();
+        try target.withdraw() {
+            // Reaching this line would mean the re-entry was paid out.
+        } catch (bytes memory reason) {
+            lastReentryError = reason;
+        }
     }
 }
